@@ -1,0 +1,1 @@
+*.exe *_bin /simulator/__pycache__/ .env
