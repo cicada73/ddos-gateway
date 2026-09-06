@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    expose:
+      - "9000"
+
+  gateway-a:
+    build: ./gateway
+    environment:
+      REPLICA_ID: A
+      PORT: 8080
+      REDIS_ADDR: redis:6379
+      BACKEND_URL: http://backend:9000
+    depends_on:
+      - redis
+      - backend
+    expose:
+      - "8080"
+
+  gateway-b:
+    build: ./gateway
+    environment:
+      REPLICA_ID: B
+      PORT: 8080
+      REDIS_ADDR: redis:6379
+      BACKEND_URL: http://backend:9000
+    depends_on:
+      - redis
+      - backend
+    expose:
+      - "8080"
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - gateway-a
+      - gateway-b
