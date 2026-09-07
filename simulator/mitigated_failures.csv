@@ -1,0 +1,2 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+GET,/items [ATTACK],HTTPError('429 Client Error: Too Many Requests for url: /items [ATTACK]'),8177,2026-09-07T10:10:37Z,2026-09-07T10:10:50Z

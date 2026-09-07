@@ -8,6 +8,10 @@ services:
 
   backend:
     build: ./backend
+    ports:
+      - "9000:9000"  # exposed directly so we can measure UNMITIGATED baseline
+                       # traffic for comparison; not something you'd do in a
+                       # real deployment, where only the gateway is public.
     expose:
       - "9000"
 
