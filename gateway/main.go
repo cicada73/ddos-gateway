@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"ddos-gateway/gateway/limiter"
@@ -51,8 +52,19 @@ func extractIdentity(r *http.Request) (rateLimitKey, ip, apiKey string) {
 // The trade-off: a Redis outage means temporarily unlimited/unscored
 // traffic (bad) rather than every legitimate user being locked out because
 // the gateway's dependency died (worse for availability).
-func gatewayMiddleware(next http.Handler, tb *limiter.RedisTokenBucketLimiter, ipCycle, keyCycle *limiter.IdentityCycleDetector) http.Handler {
+//
+// Every outcome is recorded to Prometheus (outcome + how long the decision
+// took), which is what Phase 5's dashboard visualizes.
+func gatewayMiddleware(next http.Handler, tb *limiter.RedisTokenBucketLimiter, ipCycle, keyCycle *limiter.IdentityCycleDetector, replicaID string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		outcome := "allowed" // overwritten below on any blocking path
+
+		defer func() {
+			requestsTotal.WithLabelValues(outcome, replicaID).Inc()
+			requestDuration.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
+		}()
+
 		rateLimitKey, ip, apiKey := extractIdentity(r)
 		ctx := r.Context()
 
@@ -61,6 +73,10 @@ func gatewayMiddleware(next http.Handler, tb *limiter.RedisTokenBucketLimiter, i
 			if err != nil {
 				log.Printf("ANOMALY ERROR (failing open) ip=%s err=%v", ip, err)
 			} else if ipFlagged {
+				outcome = "anomaly_blocked"
+				if ipDistinctKeys > 0 { // >0 means THIS request is what newly triggered the flag
+					anomalyNewFlagsTotal.WithLabelValues("key_cycling").Inc()
+				}
 				http.Error(w, "request pattern flagged as anomalous", http.StatusForbidden)
 				log.Printf("ANOMALY BLOCKED ip=%s reason=key_cycling distinct_keys=%d", ip, ipDistinctKeys)
 				return
@@ -70,6 +86,10 @@ func gatewayMiddleware(next http.Handler, tb *limiter.RedisTokenBucketLimiter, i
 			if err != nil {
 				log.Printf("ANOMALY ERROR (failing open) key=%s err=%v", apiKey, err)
 			} else if keyFlagged {
+				outcome = "anomaly_blocked"
+				if keyDistinctIPs > 0 {
+					anomalyNewFlagsTotal.WithLabelValues("ip_cycling").Inc()
+				}
 				http.Error(w, "request pattern flagged as anomalous", http.StatusForbidden)
 				log.Printf("ANOMALY BLOCKED key=%s reason=ip_cycling distinct_ips=%d", apiKey, keyDistinctIPs)
 				return
@@ -86,6 +106,7 @@ func gatewayMiddleware(next http.Handler, tb *limiter.RedisTokenBucketLimiter, i
 		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%.0f", remaining))
 
 		if !allowed {
+			outcome = "rate_limited"
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			log.Printf("BLOCKED key=%s path=%s", rateLimitKey, r.URL.Path)
@@ -119,12 +140,15 @@ func main() {
 	ipCycle := limiter.NewIdentityCycleDetector(rdb, "ip-keys", 60*time.Second, 5, 2*time.Minute)
 	keyCycle := limiter.NewIdentityCycleDetector(rdb, "key-ips", 60*time.Second, 5, 2*time.Minute)
 
-	handler := gatewayMiddleware(proxy, tb, ipCycle, keyCycle)
-
 	port := getenv("PORT", "8080")
 	replicaID := getenv("REPLICA_ID", "unknown")
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/", gatewayMiddleware(proxy, tb, ipCycle, keyCycle, replicaID))
+
 	log.Printf("gateway[%s] listening on :%s, proxying to %s, redis at %s", replicaID, port, backendURL, redisAddr)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
+	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
 
 func getenv(key, fallback string) string {

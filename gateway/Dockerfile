@@ -3,6 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY main.go ./
+COPY metrics.go ./
 COPY limiter ./limiter
 RUN go build -o /gateway .
 
