@@ -133,11 +133,22 @@ func main() {
 	// changes is that this state is now shared across every replica.
 	tb := limiter.NewRedisTokenBucketLimiter(rdb, 20, 5)
 
-	// Anomaly detection: an IP using more than 5 distinct API keys within
-	// 60 seconds gets flagged (key cycling / credential stuffing), as does
-	// an API key seen from more than 5 distinct IPs within 60 seconds
-	// (a shared/stolen key or a distributed attack). Flags last 2 minutes.
-	ipCycle := limiter.NewIdentityCycleDetector(rdb, "ip-keys", 60*time.Second, 5, 2*time.Minute)
+	// Anomaly detection: two different thresholds, deliberately.
+	//
+	// An IP using many distinct API keys is ambiguous - it could be one
+	// attacker rotating credentials, or it could just be many legitimate
+	// users sharing one visible IP (a corporate network, university, or
+	// carrier-grade NAT on mobile networks are all extremely common in
+	// practice). A low threshold here produces real false positives -
+	// discovered during testing, when simulated legitimate traffic from
+	// many distinct users on one test machine got collectively blocked.
+	// 30 distinct keys/minute from one IP is a much stronger signal of
+	// actual abuse while still tolerating realistic shared-IP traffic.
+	//
+	// An API KEY appearing from many distinct IPs is a much less ambiguous
+	// signal - a single legitimate credential rarely gets used from more
+	// than a handful of locations within a minute, so this stays strict.
+	ipCycle := limiter.NewIdentityCycleDetector(rdb, "ip-keys", 60*time.Second, 30, 2*time.Minute)
 	keyCycle := limiter.NewIdentityCycleDetector(rdb, "key-ips", 60*time.Second, 5, 2*time.Minute)
 
 	port := getenv("PORT", "8080")
