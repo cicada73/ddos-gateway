@@ -29,19 +29,28 @@ import (
 // users all appeared to be "one IP using many keys", because they were all
 // being seen through nginx's address rather than their own.
 //
-// Trusting X-Forwarded-For unconditionally is safe specifically because
-// nginx is the ONLY entry point exposed to the host (docker-compose.yml
-// only publishes nginx's port; the gateway replicas use `expose`, not
-// `ports`, so nothing outside the Docker network can reach them directly
-// to forge this header). If that assumption ever changes - the gateway
-// becoming directly reachable - this would need to validate the header
-// against a list of trusted proxy hops instead of trusting it blindly.
+// CRITICAL: take the LAST entry in the chain, not the first. nginx's
+// $proxy_add_x_forwarded_for APPENDS its own trusted, real connecting IP
+// to whatever X-Forwarded-For value a client already sent - it does not
+// overwrite it. So a client attempting to spoof its identity would send
+// "X-Forwarded-For: 1.2.3.4", and nginx would forward it as
+// "1.2.3.4, <attacker's real IP>" - the FIRST entry is attacker-controlled
+// and forgeable; the LAST entry is the one nginx itself appended from the
+// actual TCP connection, which cannot be forged. An earlier version of
+// this function took the first entry, which would have trusted exactly
+// the value an attacker could freely fake - caught via testing when
+// spoofed-looking traffic wasn't being attributed correctly.
+//
+// Trusting X-Forwarded-For at all is safe specifically because nginx is
+// the ONLY entry point exposed to the host (docker-compose.yml only
+// publishes nginx's port; the gateway replicas use `expose`, not `ports`,
+// so nothing outside the Docker network can reach them directly). If that
+// assumption changes - the gateway becoming directly reachable - this
+// would need to validate against a list of trusted proxy hops instead.
 func clientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		// Can be a comma-separated chain (client, proxy1, proxy2, ...) -
-		// the first entry is the original client.
-		if comma := strings.Index(fwd, ","); comma != -1 {
-			return strings.TrimSpace(fwd[:comma])
+		if comma := strings.LastIndex(fwd, ","); comma != -1 {
+			return strings.TrimSpace(fwd[comma+1:])
 		}
 		return strings.TrimSpace(fwd)
 	}

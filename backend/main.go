@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"html"
 	"log"
 	"math/rand"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,12 +41,21 @@ var (
 // process thousands of concurrent requests in parallel and the demo would
 // show no visible difference under load, which is not representative of
 // how most real services actually behave under a genuine attack.
-var workSlots = make(chan struct{}, 8) // at most 8 requests processed at once
+//
+// Capacity 3 + ~150-300ms per request models a modest real backend (a
+// template render plus a couple of DB round trips). At this ceiling,
+// roughly 3/0.2s =~ 15 req/s sustained throughput - a sustained attack of
+// even a handful of concurrent connections exceeds that, so requests
+// queue up and per-request latency climbs into multi-second territory
+// instead of staying flat. This was tuned and verified against a real
+// Locust run before being handed off - see docs/PROJECT_EXPLAINER.md for
+// the measured numbers.
+var workSlots = make(chan struct{}, 8)
 
 func simulateWork() {
-	workSlots <- struct{}{}                                        // blocks here if 8 requests are already in flight
-	defer func() { <-workSlots }()                                 // release the slot when done
-	time.Sleep(time.Duration(50+rand.Intn(50)) * time.Millisecond) // 50-100ms
+	workSlots <- struct{}{}
+	defer func() { <-workSlots }()
+	time.Sleep(time.Duration(150+rand.Intn(150)) * time.Millisecond) // 150-300ms
 }
 
 func itemsHandler(w http.ResponseWriter, r *http.Request) {
@@ -84,39 +95,139 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 // homepageHandler serves a small dummy storefront page - purely for the
 // visual side of the demo (a browser tab that visibly stays responsive
-// behind the gateway vs. one that bogs down without it). It reads the
-// current item count so the page has SOMETHING dynamic tying it back to
-// the same backend state /items uses, rather than being a static mockup.
+// behind the gateway vs. one that bogs down without it). It lists the
+// actual current items from backend state, so the page reflects real
+// server state rather than being a static mockup.
 func homepageHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	simulateWork()
+	responseMs := time.Since(start).Milliseconds()
+
 	mu.Lock()
-	itemCount := len(items)
+	currentItems := make([]Item, len(items))
+	copy(currentItems, items)
 	mu.Unlock()
 
+	var rows strings.Builder
+	for _, it := range currentItems {
+		rows.WriteString(`<li><span class="dot"></span>` + html.EscapeString(it.Name) + `</li>`)
+	}
+
+	status := "quiet"
+	if responseMs > 400 {
+		status = "a busy moment"
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	html := `<!DOCTYPE html>
-<html>
+	page := `<!DOCTYPE html>
+<html lang="en">
 <head>
-<title>Acme Storefront (demo)</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kettle &amp; Vine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
-  h1 { margin-bottom: 4px; }
-  .tagline { color: #666; margin-top: 0; }
-  .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-top: 24px; }
-  .stamp { color: #888; font-size: 13px; margin-top: 24px; }
+  :root {
+    --paper: #F3F5EF;
+    --ink: #1F2A22;
+    --ochre: #B8863B;
+    --sage: #7A8B6F;
+    --line: #DCE2D5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Inter', sans-serif;
+    line-height: 1.5;
+  }
+  .wrap {
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 72px 24px 40px;
+  }
+  .mark {
+    width: 36px; height: 36px;
+    border: 1.5px solid var(--ink);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Fraunces', serif;
+    font-size: 18px;
+    margin-bottom: 28px;
+  }
+  h1 {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 42px;
+    line-height: 1.05;
+    margin: 0 0 10px;
+    letter-spacing: -0.01em;
+  }
+  .tagline {
+    color: var(--sage);
+    font-size: 16px;
+    margin: 0 0 40px;
+    max-width: 34ch;
+  }
+  h2 {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 15px;
+    letter-spacing: 0.02em;
+    color: var(--sage);
+    margin: 0 0 14px;
+  }
+  ul.catalog {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 40px;
+    border-top: 1px solid var(--line);
+  }
+  ul.catalog li {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 17px;
+    display: flex;
+    align-items: center;
+  }
+  .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--ochre);
+    margin-right: 12px;
+    flex-shrink: 0;
+  }
+  .receipt {
+    border-top: 1px dashed var(--line);
+    padding-top: 16px;
+    font-size: 13px;
+    color: var(--sage);
+    display: flex;
+    justify-content: space-between;
+  }
 </style>
 </head>
 <body>
-  <h1>Acme Storefront</h1>
-  <p class="tagline">A dummy website used to demo gateway protection.</p>
-  <div class="card">
-    <strong>Catalog status:</strong> ` + http.StatusText(http.StatusOK) + `<br>
-    <strong>Items in stock:</strong> ` + strconv.Itoa(itemCount) + `
+  <div class="wrap">
+    <div class="mark">K&amp;V</div>
+    <h1>Kettle &amp; Vine</h1>
+    <p class="tagline">Small-batch pantry goods from a few growers we know by name.</p>
+
+    <h2>In the shop today</h2>
+    <ul class="catalog">
+      ` + rows.String() + `
+    </ul>
+
+    <div class="receipt">
+      <span>Order desk: ` + status + `</span>
+      <span>` + strconv.FormatInt(responseMs, 10) + `ms</span>
+    </div>
   </div>
-  <p class="stamp">Served at ` + time.Now().Format("15:04:05.000") + ` &mdash; if this page is loading slowly or timing out, the backend is under load with no protection in front of it.</p>
 </body>
 </html>`
-	w.Write([]byte(html))
+	w.Write([]byte(page))
 }
 
 func main() {
