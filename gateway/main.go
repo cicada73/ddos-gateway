@@ -8,6 +8,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -16,17 +17,48 @@ import (
 	"ddos-gateway/gateway/limiter"
 )
 
-// extractIdentity pulls both the source IP and (if present) the API key
+// clientIP resolves the real client address, preferring X-Forwarded-For
+// (set by our nginx reverse proxy - see infra/nginx.conf) over RemoteAddr.
+//
+// Why this matters: every request that reaches this gateway has already
+// passed through nginx, so RemoteAddr is always nginx's OWN container IP,
+// not the original client's. Without this fix, every distinct real client
+// collapses onto one identical perceived identity - breaking per-IP rate
+// limiting for anonymous traffic entirely, and this is what actually
+// caused the false positive found during testing: many distinct simulated
+// users all appeared to be "one IP using many keys", because they were all
+// being seen through nginx's address rather than their own.
+//
+// Trusting X-Forwarded-For unconditionally is safe specifically because
+// nginx is the ONLY entry point exposed to the host (docker-compose.yml
+// only publishes nginx's port; the gateway replicas use `expose`, not
+// `ports`, so nothing outside the Docker network can reach them directly
+// to forge this header). If that assumption ever changes - the gateway
+// becoming directly reachable - this would need to validate the header
+// against a list of trusted proxy hops instead of trusting it blindly.
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		// Can be a comma-separated chain (client, proxy1, proxy2, ...) -
+		// the first entry is the original client.
+		if comma := strings.Index(fwd, ","); comma != -1 {
+			return strings.TrimSpace(fwd[:comma])
+		}
+		return strings.TrimSpace(fwd)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// extractIdentity pulls both the client IP and (if present) the API key
 // from a request. Phase 1-2 only needed one combined "key" - Phase 4 needs
 // both separately, since anomaly detection is specifically about the
 // RELATIONSHIP between the two (how many keys does this IP use? how many
 // IPs does this key show up from?), not just picking one as the identity.
 func extractIdentity(r *http.Request) (rateLimitKey, ip, apiKey string) {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	ip = host
+	ip = clientIP(r)
 	apiKey = r.Header.Get("X-API-Key")
 
 	if apiKey != "" {
